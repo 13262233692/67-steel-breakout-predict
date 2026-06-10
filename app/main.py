@@ -22,6 +22,7 @@ from app.schemas.prediction import (
     BreakoutPrediction,
     GridTensorInfo,
     SystemStatus,
+    BreakoutExplanation,
 )
 
 logging.basicConfig(
@@ -64,7 +65,7 @@ async def lifespan(app: FastAPI):
         spatiotemporal_grid.get_current_batch_id(),
     )
 
-    inference_engine = BreakoutInferenceEngine(spatiotemporal_grid)
+    inference_engine = BreakoutInferenceEngine(spatiotemporal_grid, sensor_mapper)
     inference_engine.load_model()
 
     kafka_consumer = ThermocoupleKafkaConsumer(
@@ -122,6 +123,10 @@ class EngineStatusResponse(BaseModel):
     last_gc_ts: float
     cuda_mem_peak_mb: float
     latest_prediction: Optional[BreakoutPrediction]
+    gradcam_enabled: bool
+    gradcam_explanation_count: int
+    gradcam_alert_threshold: float
+    latest_explanation: Optional[BreakoutExplanation]
 
 
 @app.get("/health", summary="健康检查")
@@ -161,6 +166,10 @@ async def get_engine_status():
         last_gc_ts=s.last_gc_ts,
         cuda_mem_peak_mb=s.cuda_mem_peak_mb,
         latest_prediction=s.latest_prediction,
+        gradcam_enabled=s.gradcam_enabled,
+        gradcam_explanation_count=s.gradcam_explanation_count,
+        gradcam_alert_threshold=s.gradcam_alert_threshold,
+        latest_explanation=s.latest_explanation,
     )
 
 
@@ -173,6 +182,38 @@ async def get_latest_prediction():
     if inference_engine is None:
         raise HTTPException(status_code=503, detail="推理引擎未初始化")
     return inference_engine.status.latest_prediction
+
+
+@app.get(
+    "/api/v1/explain",
+    response_model=Optional[BreakoutExplanation],
+    summary="获取最新Grad-CAM可解释性热力图与异常传感器定位",
+)
+async def get_latest_explanation():
+    if inference_engine is None:
+        raise HTTPException(status_code=503, detail="推理引擎未初始化")
+    if not inference_engine.status.gradcam_enabled:
+        raise HTTPException(status_code=503, detail="Grad-CAM解释模块未启用")
+    return inference_engine.status.latest_explanation
+
+
+@app.post(
+    "/api/v1/explain/trigger",
+    response_model=BreakoutExplanation,
+    summary="手动触发Grad-CAM解释（无论是否告警）",
+)
+async def trigger_explanation(force: bool = True):
+    if inference_engine is None:
+        raise HTTPException(status_code=503, detail="推理引擎未初始化")
+    if not inference_engine.status.gradcam_enabled:
+        raise HTTPException(status_code=503, detail="Grad-CAM解释模块未启用")
+    explanation = inference_engine.explain_current(force=force)
+    if explanation is None:
+        raise HTTPException(
+            status_code=400,
+            detail="时空网格数据不足或Grad-CAM计算失败，请等待更多传感器数据",
+        )
+    return explanation
 
 
 @app.post(

@@ -146,7 +146,7 @@ class TestBatchStateReset:
     def test_inference_engine_batch_switch_lifecycle(self):
         mapper = SensorMapper(settings.sensor_layout_path)
         grid = SpatiotemporalGrid(mapper, time_window=5)
-        engine = BreakoutInferenceEngine(grid, interval=0.01)
+        engine = BreakoutInferenceEngine(grid, mapper, interval=0.01)
         engine.load_model()
 
         _fill_grid(grid, 10, base_temp=1200.0)
@@ -169,7 +169,7 @@ class TestBatchStateReset:
     def test_batch_switch_then_inference_no_tail(self):
         mapper = SensorMapper(settings.sensor_layout_path)
         grid = SpatiotemporalGrid(mapper, time_window=5)
-        engine = BreakoutInferenceEngine(grid, interval=0.01)
+        engine = BreakoutInferenceEngine(grid, mapper, interval=0.01)
         engine.load_model()
 
         _fill_grid(grid, 10, base_temp=1600.0)
@@ -190,7 +190,7 @@ class TestGCSafety:
     def test_periodic_gc_triggered(self):
         mapper = SensorMapper(settings.sensor_layout_path)
         grid = SpatiotemporalGrid(mapper, time_window=5)
-        engine = BreakoutInferenceEngine(grid, interval=0.01)
+        engine = BreakoutInferenceEngine(grid, mapper, interval=0.01)
         engine._INFERENCES_PER_GC = 5
         engine.load_model()
 
@@ -205,7 +205,7 @@ class TestGCSafety:
     def test_aggressive_gc_works(self):
         mapper = SensorMapper(settings.sensor_layout_path)
         grid = SpatiotemporalGrid(mapper, time_window=5)
-        engine = BreakoutInferenceEngine(grid, interval=0.01)
+        engine = BreakoutInferenceEngine(grid, mapper, interval=0.01)
         engine.load_model()
 
         gc_before = engine.status.gc_count

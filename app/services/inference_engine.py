@@ -15,7 +15,9 @@ import numpy as np
 from app.config import settings
 from app.models.cnn_lstm import CNNLSTMModel, load_model
 from app.services.spatiotemporal_grid import SpatiotemporalGrid, BatchInfo
-from app.schemas.prediction import BreakoutPrediction
+from app.services.gradcam_explainer import GradCAMExplainer
+from app.schemas.prediction import BreakoutPrediction, BreakoutExplanation
+from app.utils.sensor_mapping import SensorMapper
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,10 @@ class InferenceStatus:
     last_gc_ts: float = 0.0
     gc_count: int = 0
     cuda_mem_peak_mb: float = 0.0
+    gradcam_enabled: bool = False
+    gradcam_explanation_count: int = 0
+    gradcam_alert_threshold: float = 0.85
+    latest_explanation: Optional[BreakoutExplanation] = None
 
 
 @dataclass
@@ -59,17 +65,25 @@ class BreakoutInferenceEngine:
     def __init__(
         self,
         grid: SpatiotemporalGrid,
+        sensor_mapper: SensorMapper,
         model_path: Optional[str] = None,
         interval: float = settings.inference_interval,
         alert_threshold: float = 0.7,
+        gradcam_alert_threshold: float = 0.85,
+        gradcam_auto_explain: bool = True,
     ):
         self.grid = grid
+        self.sensor_mapper = sensor_mapper
         self.model_path = model_path or settings.model_path
         self.interval = interval
         self.alert_threshold = alert_threshold
+        self.gradcam_alert_threshold = gradcam_alert_threshold
+        self.gradcam_auto_explain = gradcam_auto_explain
         self.status = InferenceStatus()
+        self.status.gradcam_alert_threshold = gradcam_alert_threshold
 
         self._model: Optional[CNNLSTMModel] = None
+        self._explainer: Optional[GradCAMExplainer] = None
         self._device: str = "cpu"
         self._cuda_device: Optional[torch.device] = None
         self._task: Optional[asyncio.Task] = None
@@ -93,7 +107,14 @@ class BreakoutInferenceEngine:
                 if self._device == "cuda"
                 else None
             )
+            self._explainer = GradCAMExplainer(
+                model=self._model,
+                sensor_mapper=self.sensor_mapper,
+                alert_threshold=self.gradcam_alert_threshold,
+                top_k_sensors=10,
+            )
             self.status.model_loaded = True
+            self.status.gradcam_enabled = True
             self.status.lifecycle_state = LifecycleState.ACTIVE
             self.status.current_batch_id = self.grid.get_current_batch_id()
             logger.info("模型加载成功，设备: %s", self._device)
@@ -104,6 +125,7 @@ class BreakoutInferenceEngine:
         except Exception as e:
             logger.error("模型加载失败: %s", e)
             self.status.model_loaded = False
+            self.status.gradcam_enabled = False
             self.status.lifecycle_state = LifecycleState.ERROR
             return False
 
@@ -182,7 +204,45 @@ class BreakoutInferenceEngine:
                 prob_value,
                 prediction.timestamp.isoformat(),
             )
+            if self.gradcam_auto_explain and prob_value >= self.gradcam_alert_threshold and self._explainer is not None:
+                try:
+                    tensor_4d = self.grid.get_tensor_with_batch()
+                    if tensor_4d is not None:
+                        device = self._cuda_device if self._cuda_device is not None else torch.device("cpu")
+                        explain_tensor = torch.from_numpy(tensor_4d).to(device)
+                        explanation = self._explainer.explain_from_grid(explain_tensor, force=False)
+                        if explanation is not None:
+                            self.status.latest_explanation = explanation
+                            self.status.gradcam_explanation_count += 1
+                            logger.info(
+                                "🎯 Grad-CAM解释生成: 异常热点=%d个, Top权重=%.3f",
+                                len(explanation.anomaly_sensors),
+                                explanation.anomaly_sensors[0].attention_weight if explanation.anomaly_sensors else 0.0,
+                            )
+                        del explain_tensor
+                except Exception as e:
+                    logger.error("Grad-CAM解释失败: %s", e)
         return prediction
+
+    def explain_current(self, force: bool = True) -> Optional[BreakoutExplanation]:
+        if not self.status.model_loaded or self._model is None or self._explainer is None:
+            return None
+        tensor_np = self.grid.get_tensor_with_batch()
+        if tensor_np is None:
+            return None
+        try:
+            device = self._cuda_device if self._cuda_device is not None else torch.device("cpu")
+            input_tensor = torch.from_numpy(tensor_np).to(device)
+            explanation = self._explainer.explain_from_grid(input_tensor, force=force)
+            del input_tensor
+            if explanation is not None:
+                self.status.latest_explanation = explanation
+                if force:
+                    self.status.gradcam_explanation_count += 1
+            return explanation
+        except Exception as e:
+            logger.error("显式Grad-CAM解释失败: %s", e)
+            return None
 
     def switch_batch(self) -> BatchSwitchReport:
         self.status.lifecycle_state = LifecycleState.BATCH_SWITCHING

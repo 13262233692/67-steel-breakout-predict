@@ -144,7 +144,7 @@ def test_inference_engine_full_pipeline():
     mapper = SensorMapper(settings.sensor_layout_path)
     grid = SpatiotemporalGrid(mapper, time_window=5)
 
-    engine = BreakoutInferenceEngine(grid, interval=0.1)
+    engine = BreakoutInferenceEngine(grid, mapper, interval=0.1)
     engine.load_model()
     assert engine.status.model_loaded is True
 

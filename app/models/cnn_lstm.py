@@ -1,4 +1,5 @@
 import gc
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,6 +54,8 @@ class CNNLSTMModel(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, 1, grid_height, grid_width)
             cnn_out_dim = self.cnn(dummy).shape[1]
+            self._conv3_out_h = dummy.shape[2] // 8
+            self._conv3_out_w = dummy.shape[3] // 8
         self.cnn_out_dim = cnn_out_dim
 
         self.lstm = nn.LSTM(
@@ -75,6 +78,10 @@ class CNNLSTMModel(nn.Module):
         )
 
         self._cached_hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._gradcam_hooks: list = []
+        self._activations: Optional[torch.Tensor] = None
+        self._gradients: Optional[torch.Tensor] = None
+        self._gradcam_enabled: bool = False
 
     def _forward_cnn_per_step(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, time_steps, H, W = x.shape
@@ -130,6 +137,154 @@ class CNNLSTMModel(nn.Module):
             gc.collect()
 
         return prob_scalar
+
+    def _save_activation_hook(self, module, input, output):
+        self._activations = output.detach()
+
+    def _save_gradient_hook(self, module, grad_input, grad_output):
+        self._gradients = grad_output[0].detach()
+
+    def enable_gradcam(self) -> None:
+        if self._gradcam_enabled:
+            return
+        target_layer = self.cnn.conv3
+        fw_hook = target_layer.register_forward_hook(self._save_activation_hook)
+        bw_hook = target_layer.register_full_backward_hook(self._save_gradient_hook)
+        self._gradcam_hooks = [fw_hook, bw_hook]
+        self._gradcam_enabled = True
+
+    def disable_gradcam(self) -> None:
+        for hook in self._gradcam_hooks:
+            hook.remove()
+        self._gradcam_hooks.clear()
+        self._activations = None
+        self._gradients = None
+        self._gradcam_enabled = False
+
+    def _run_with_grad(self, x: torch.Tensor) -> Tuple[float, torch.Tensor]:
+        batch_size = x.size(0)
+        device = x.device
+
+        batch_flat = x.unsqueeze(2).view(batch_size * self.time_steps, 1, self.grid_height, self.grid_width)
+        conv_out = self.cnn.conv1(batch_flat)
+        conv_out = self.cnn.pool1(F.relu(self.cnn.bn1(conv_out)))
+        conv_out = self.cnn.conv2(conv_out)
+        conv_out = self.cnn.pool2(F.relu(self.cnn.bn2(conv_out)))
+        conv_out = self.cnn.conv3(conv_out)
+        post_conv = F.relu(self.cnn.bn3(conv_out))
+        self._activations = conv_out
+
+        conv_features = self.cnn.pool3(post_conv)
+        conv_features = self.cnn.dropout(conv_features)
+        conv_features = conv_features.view(batch_size, self.time_steps, -1)
+
+        h0, c0 = self._build_zero_hidden(batch_size, device)
+        lstm_out, _ = self.lstm(conv_features, (h0, c0))
+        last_hidden = lstm_out[:, -1, :]
+        logits = self.classifier(last_hidden)
+        probs = torch.sigmoid(logits)
+        prob_scalar = float(probs.detach().cpu().item())
+
+        return prob_scalar, conv_out
+
+    def compute_gradcam(
+        self,
+        x: torch.Tensor,
+        target_class: int = 0,
+        upsample_to_input: bool = True,
+    ) -> Tuple[float, np.ndarray]:
+        if not self._gradcam_enabled:
+            self.enable_gradcam()
+
+        self.eval()
+        was_training = self.training
+        device = x.device
+        batch_size = x.size(0)
+
+        self.zero_grad(set_to_none=True)
+
+        x_var = x.clone().detach().requires_grad_(True)
+
+        batch_flat = x_var.unsqueeze(2).view(
+            batch_size * self.time_steps, 1, self.grid_height, self.grid_width
+        )
+
+        c1 = self.cnn.conv1(batch_flat)
+        c1 = self.cnn.pool1(F.relu(self.cnn.bn1(c1)))
+        c2 = self.cnn.conv2(c1)
+        c2 = self.cnn.pool2(F.relu(self.cnn.bn2(c2)))
+        c3 = self.cnn.conv3(c2)
+        activations = c3
+        activations.retain_grad()
+        post_c3 = F.relu(self.cnn.bn3(c3))
+        cnn_out = self.cnn.pool3(post_c3)
+        cnn_out = self.cnn.dropout(cnn_out)
+        cnn_out = cnn_out.view(batch_size, self.time_steps, -1)
+
+        h0, c0 = self._build_zero_hidden(batch_size, device)
+        lstm_out, _ = self.lstm(cnn_out, (h0, c0))
+        last_hidden = lstm_out[:, -1, :]
+        logits = self.classifier(last_hidden)
+        probs = torch.sigmoid(logits)
+        probs_np = probs.detach().cpu().numpy().reshape(-1)
+        prob_scalar = float(probs_np[0])
+
+        target = torch.zeros_like(logits)
+        target[:, target_class] = 1.0
+        logits.backward(gradient=target, retain_graph=False)
+
+        gradients = activations.grad
+        if gradients is None:
+            gradients = torch.zeros_like(activations)
+
+        act = activations.detach()
+        grad = gradients.detach()
+
+        b_t, c, h, w = act.shape
+        act_reshaped = act.view(batch_size, self.time_steps, c, h, w)
+        grad_reshaped = grad.view(batch_size, self.time_steps, c, h, w)
+
+        act_last = act_reshaped[:, -1, :, :, :]
+        grad_last = grad_reshaped[:, -1, :, :, :]
+
+        weights = torch.mean(grad_last, dim=(2, 3), keepdim=True)
+        cam = torch.sum(weights * act_last, dim=1, keepdim=True)
+        cam = F.relu(cam)
+
+        if upsample_to_input:
+            cam = F.interpolate(
+                cam,
+                size=(self.grid_height, self.grid_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        cam = cam[0:1, ...]
+        cam_np = cam.squeeze().cpu().numpy()
+        if cam_np.ndim == 0:
+            cam_np = np.array([[float(cam_np)]])
+        elif cam_np.ndim == 1:
+            cam_np = cam_np.reshape(1, -1)
+        cam_max = cam_np.max() if cam_np.max() > 0 else 1e-8
+        cam_np = cam_np / cam_max
+        cam_np = np.clip(cam_np, 0.0, 1.0)
+
+        del (
+            x_var, batch_flat, c1, c2, c3, activations, post_c3,
+            cnn_out, lstm_out, last_hidden, logits, probs, probs_np, target,
+            gradients, act, grad, act_reshaped, grad_reshaped,
+            act_last, grad_last, weights, cam,
+        )
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
+        gc.collect()
+
+        self.zero_grad(set_to_none=True)
+        if was_training:
+            self.train()
+
+        return prob_scalar, cam_np.astype(np.float32)
 
     def reset_hidden_states(self) -> None:
         if self._cached_hidden is not None:
