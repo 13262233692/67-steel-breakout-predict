@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "description": "连铸机结晶器热电偶传感器物理布局",
+    "grid_height": 16,
+    "grid_width": 24,
+    "total_sensors": 384,
+    "height_direction": "casting_direction_top_to_bottom",
+    "width_direction": "mould_width_left_to_right",
+    "row_spacing_mm": 50,
+    "col_spacing_mm": 50,
+    "sensor_id_pattern": "TC_R{row:02d}_C{col:02d}"
+  }
+}
