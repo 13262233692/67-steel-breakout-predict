@@ -1,5 +1,7 @@
-import numpy as np
+import gc
 import time
+import uuid
+import numpy as np
 from typing import List, Optional, Tuple, Deque
 from collections import deque
 from dataclasses import dataclass, field
@@ -14,6 +16,15 @@ class TimeStep:
     timestamp: float
     grid: np.ndarray
     filled_mask: np.ndarray
+
+
+@dataclass
+class BatchInfo:
+    batch_id: str
+    start_ts: float
+    end_ts: Optional[float] = None
+    readings_count: int = 0
+    inference_count: int = 0
 
 
 class SpatiotemporalGrid:
@@ -40,6 +51,16 @@ class SpatiotemporalGrid:
         self._bucket_duration: float = 1.0
 
         self.total_readings_processed = 0
+
+        self._current_batch: BatchInfo = BatchInfo(
+            batch_id=self._gen_batch_id(),
+            start_ts=time.time(),
+        )
+        self._batch_history: Deque[BatchInfo] = deque(maxlen=128)
+
+    @staticmethod
+    def _gen_batch_id() -> str:
+        return f"BATCH-{uuid.uuid4().hex[:12].upper()}"
 
     def _normalize_temperature(self, temp: float) -> float:
         clipped = np.clip(temp, self.min_temp, self.max_temp)
@@ -94,6 +115,7 @@ class SpatiotemporalGrid:
         self._current_step.grid[row, col] = norm_temp
         self._current_step.filled_mask[row, col] = True
         self.total_readings_processed += 1
+        self._current_batch.readings_count += 1
 
     def ingest_batch(self, readings: List[ThermocoupleReading]) -> None:
         sorted_readings = sorted(readings, key=lambda r: r.timestamp)
@@ -124,8 +146,42 @@ class SpatiotemporalGrid:
     def get_shape(self) -> Tuple[int, int, int]:
         return (self.time_window, self.grid_height, self.grid_width)
 
-    def reset(self) -> None:
+    def get_current_batch_id(self) -> str:
+        return self._current_batch.batch_id
+
+    def get_batch_info(self) -> BatchInfo:
+        return self._current_batch
+
+    def batch_switch(self) -> BatchInfo:
+        self.flush()
+
+        old = self._current_batch
+        old.end_ts = time.time()
+        self._batch_history.append(old)
+
+        for step in self._time_steps:
+            del step.grid
+            del step.filled_mask
+            del step
         self._time_steps.clear()
+        if self._current_step is not None:
+            del self._current_step.grid
+            del self._current_step.filled_mask
+            del self._current_step
         self._current_step = None
         self._current_step_bucket = None
+
+        gc.collect()
+
+        new_batch = BatchInfo(
+            batch_id=self._gen_batch_id(),
+            start_ts=time.time(),
+        )
+        self._current_batch = new_batch
+        return old
+
+    def reset(self) -> None:
+        self.batch_switch()
+        self._batch_history.clear()
         self.total_readings_processed = 0
+        gc.collect()

@@ -1,16 +1,21 @@
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.utils.sensor_mapping import SensorMapper
 from app.services.spatiotemporal_grid import SpatiotemporalGrid
 from app.services.kafka_consumer import ThermocoupleKafkaConsumer
-from app.services.inference_engine import BreakoutInferenceEngine
+from app.services.inference_engine import (
+    BreakoutInferenceEngine,
+    BatchSwitchReport,
+    LifecycleState,
+)
 from app.schemas.prediction import (
     ThermocoupleReading,
     ThermocoupleBatch,
@@ -52,10 +57,11 @@ async def lifespan(app: FastAPI):
 
     spatiotemporal_grid = SpatiotemporalGrid(sensor_mapper)
     logger.info(
-        "时空网格已初始化: 窗口=%d, 网格=%dx%d",
+        "时空网格已初始化: 窗口=%d, 网格=%dx%d, 初始批次=%s",
         spatiotemporal_grid.time_window,
         spatiotemporal_grid.grid_height,
         spatiotemporal_grid.grid_width,
+        spatiotemporal_grid.get_current_batch_id(),
     )
 
     inference_engine = BreakoutInferenceEngine(spatiotemporal_grid)
@@ -82,7 +88,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="炼钢厂漏钢预测 AI 引擎",
     description="基于CNN-LSTM混合模型的连铸结晶器粘结漏钢实时预测系统",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -93,6 +99,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class BatchSwitchResponse(BaseModel):
+    old_batch_id: str
+    new_batch_id: str
+    old_inference_count: int
+    old_reading_count: int
+    gc_triggered: bool
+    completed_ts: float = Field(default_factory=time.time)
+
+
+class EngineStatusResponse(BaseModel):
+    model_loaded: bool
+    lifecycle_state: str
+    current_batch_id: Optional[str]
+    batches_completed: int
+    total_inferences: int
+    inference_count_current_batch: int
+    avg_inference_ms: float
+    gc_count: int
+    last_gc_ts: float
+    cuda_mem_peak_mb: float
+    latest_prediction: Optional[BreakoutPrediction]
 
 
 @app.get("/health", summary="健康检查")
@@ -106,8 +135,32 @@ async def get_system_status():
         kafka_connected=kafka_consumer.status.connected if kafka_consumer else False,
         model_loaded=inference_engine.status.model_loaded if inference_engine else False,
         grid_ready=spatiotemporal_grid.is_ready() if spatiotemporal_grid else False,
-        latest_prediction=inference_engine.status.latest_prediction if inference_engine else None,
-        total_readings_processed=spatiotemporal_grid.total_readings_processed if spatiotemporal_grid else 0,
+        latest_prediction=(
+            inference_engine.status.latest_prediction if inference_engine else None
+        ),
+        total_readings_processed=(
+            spatiotemporal_grid.total_readings_processed if spatiotemporal_grid else 0
+        ),
+    )
+
+
+@app.get("/api/v1/engine/status", response_model=EngineStatusResponse, summary="推理引擎详细状态")
+async def get_engine_status():
+    if inference_engine is None:
+        raise HTTPException(status_code=503, detail="推理引擎未初始化")
+    s = inference_engine.status
+    return EngineStatusResponse(
+        model_loaded=s.model_loaded,
+        lifecycle_state=s.lifecycle_state.value,
+        current_batch_id=s.current_batch_id,
+        batches_completed=s.batches_completed,
+        total_inferences=s.total_inferences,
+        inference_count_current_batch=s.inference_count_current_batch,
+        avg_inference_ms=s.avg_inference_ms,
+        gc_count=s.gc_count,
+        last_gc_ts=s.last_gc_ts,
+        cuda_mem_peak_mb=s.cuda_mem_peak_mb,
+        latest_prediction=s.latest_prediction,
     )
 
 
@@ -150,6 +203,62 @@ async def get_grid_info():
     )
 
 
+@app.get(
+    "/api/v1/batch/current",
+    summary="获取当前生产批次ID及元数据",
+)
+async def get_current_batch():
+    if spatiotemporal_grid is None:
+        raise HTTPException(status_code=503, detail="时空网格未初始化")
+    info = spatiotemporal_grid.get_batch_info()
+    return {
+        "batch_id": info.batch_id,
+        "start_ts": info.start_ts,
+        "end_ts": info.end_ts,
+        "readings_count": info.readings_count,
+        "inference_count": info.inference_count,
+        "lifecycle_state": (
+            inference_engine.status.lifecycle_state.value if inference_engine else "UNKNOWN"
+        ),
+    }
+
+
+@app.post(
+    "/api/v1/batch/switch",
+    response_model=BatchSwitchResponse,
+    summary="批次切换（换包/换批次）：清空时空滑窗+重置LSTM+强制GC",
+)
+async def switch_batch():
+    if inference_engine is None:
+        raise HTTPException(status_code=503, detail="推理引擎未初始化")
+    report: BatchSwitchReport = inference_engine.switch_batch()
+    return BatchSwitchResponse(
+        old_batch_id=report.old_batch_id,
+        new_batch_id=report.new_batch_id,
+        old_inference_count=report.old_inference_count,
+        old_reading_count=report.old_reading_count,
+        gc_triggered=report.gc_triggered,
+    )
+
+
+@app.post(
+    "/api/v1/system/force_gc",
+    summary="强制触发显存/内存垃圾回收（运维用）",
+)
+async def force_gc():
+    if inference_engine is None:
+        raise HTTPException(status_code=503, detail="推理引擎未初始化")
+    gc_count_before = inference_engine.status.gc_count
+    inference_engine._aggressive_gc()
+    return {
+        "gc_count_before": gc_count_before,
+        "gc_count_after": inference_engine.status.gc_count,
+        "last_gc_ts": inference_engine.status.last_gc_ts,
+        "cuda_mempeak_mb": inference_engine.status.cuda_mem_peak_mb,
+        "triggered": True,
+    }
+
+
 @app.post("/api/v1/ingest", summary="手动摄入热电偶读数（调试用）")
 async def ingest_readings(batch: ThermocoupleBatch):
     if spatiotemporal_grid is None:
@@ -159,4 +268,5 @@ async def ingest_readings(batch: ThermocoupleBatch):
         "ingested": len(batch.readings),
         "time_steps_filled": spatiotemporal_grid.time_steps_filled(),
         "is_ready": spatiotemporal_grid.is_ready(),
+        "batch_id": spatiotemporal_grid.get_current_batch_id(),
     }

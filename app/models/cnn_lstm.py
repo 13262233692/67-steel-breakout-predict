@@ -1,3 +1,4 @@
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,7 +37,6 @@ class CNNLSTMModel(nn.Module):
         time_steps: int = 30,
         grid_height: int = 16,
         grid_width: int = 24,
-        cnn_out_channels: int = 64,
         lstm_hidden_size: int = 128,
         lstm_num_layers: int = 2,
         dropout: float = 0.3,
@@ -74,6 +74,8 @@ class CNNLSTMModel(nn.Module):
             nn.Linear(32, 1),
         )
 
+        self._cached_hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
     def _forward_cnn_per_step(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, time_steps, H, W = x.shape
         x = x.unsqueeze(2)
@@ -82,17 +84,23 @@ class CNNLSTMModel(nn.Module):
         cnn_features = cnn_features.view(batch_size, time_steps, -1)
         return cnn_features
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size = x.size(0)
-        cnn_features = self._forward_cnn_per_step(x)
-
+    def _build_zero_hidden(
+        self, batch_size: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         h0 = torch.zeros(
-            self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=x.device
+            self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device
         )
         c0 = torch.zeros(
-            self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=x.device
+            self.lstm_num_layers, batch_size, self.lstm_hidden_size, device=device
         )
+        return h0, c0
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size = x.size(0)
+        device = x.device
+        cnn_features = self._forward_cnn_per_step(x)
+
+        h0, c0 = self._build_zero_hidden(batch_size, device)
         lstm_out, _ = self.lstm(cnn_features, (h0, c0))
         last_hidden = lstm_out[:, -1, :]
         logits = self.classifier(last_hidden)
@@ -100,7 +108,48 @@ class CNNLSTMModel(nn.Module):
 
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
         logits = self.forward(x)
-        return torch.sigmoid(logits)
+        probs = torch.sigmoid(logits)
+        return probs.detach()
+
+    @torch.no_grad()
+    def predict_breakout(
+        self,
+        x: torch.Tensor,
+        clear_intermediates: bool = True,
+    ) -> float:
+        probs = self.predict_proba(x)
+        probs_cpu = probs.detach().cpu()
+        prob_np = probs_cpu.numpy()
+        prob_scalar = float(prob_np.reshape(-1)[0])
+
+        if clear_intermediates:
+            del probs, probs_cpu, prob_np
+            if x.device.type == "cuda":
+                with torch.cuda.device(x.device):
+                    torch.cuda.empty_cache()
+            gc.collect()
+
+        return prob_scalar
+
+    def reset_hidden_states(self) -> None:
+        if self._cached_hidden is not None:
+            h, c = self._cached_hidden
+            del h, c
+            self._cached_hidden = None
+        if next(self.parameters()).device.type == "cuda":
+            dev = next(self.parameters()).device
+            with torch.cuda.device(dev):
+                torch.cuda.empty_cache()
+        gc.collect()
+
+    def reset_batch_state(self) -> None:
+        self.reset_hidden_states()
+        for module in self.modules():
+            if hasattr(module, "reset_running_stats") and callable(module.reset_running_stats):
+                try:
+                    module.reset_running_stats()
+                except Exception:
+                    pass
 
 
 def load_model(
@@ -122,10 +171,11 @@ def load_model(
     if model_path is not None:
         try:
             state_dict = torch.load(model_path, map_location=device)
-            model.load_state_dict(state_dict)
+            model.load_state_dict(state_dict, strict=True)
         except Exception:
             pass
 
     model.to(device)
     model.eval()
+    model.reset_batch_state()
     return model
